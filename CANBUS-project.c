@@ -29,17 +29,27 @@ void on_can_err(CAN_ERR_FRAME_STRUCT *err);
 void debug_config();
 void debug_dataframe(CAN_DATA_FRAME_STRUCT *frame);
 void debug_errframe(CAN_ERR_FRAME_STRUCT *frame); 
+//
+//SPI check
+int mcp2515_check_spi();
 
-#ifndef PICO_STDIO_USB_CONNECT_WAIT_TIMEOUT_MS
-#define PICO_STDIO_USB_CONNECT_WAIT_TIMEOUT_MS (1000)
-#endif
+
+#define STARTUP_DELAY_MS 10000
 
 int main() {
 
     stdio_usb_init();
-    sleep_ms(PICO_STDIO_USB_CONNECT_WAIT_TIMEOUT_MS);
+    sleep_ms(STARTUP_DELAY_MS);
         
     can_init(REQOP_LOOPBACK);
+
+    if (!mcp2515_check_spi()) {
+        printf("MCP2515 SPI fout\n");
+        while (true) {
+            sleep_ms(1000);
+        }
+    }
+
     debug_config();
 
     can_set_rx_handler(&on_can_rx);
@@ -73,6 +83,7 @@ int main() {
             sleep_ms(5);
         }
     }
+    
 }
 
 
@@ -204,4 +215,13 @@ Version : DMK, Initial code
     printf("TEC    : 0x%.2X\n", frame->rTEC);
     printf("EFLG   : 0x%.2X\n", frame->rEFLG);
     printf("CANINTF: 0x%.2X\n", frame->rCANINTF);
+}
+int mcp2515_check_spi()
+{
+    uint8_t data = mcp2515_read_register(CANSTAT);
+    if ((data & 0xE0) == 0x40) {
+        return 1;
+    } else {
+        return 0;
+    }
 }
