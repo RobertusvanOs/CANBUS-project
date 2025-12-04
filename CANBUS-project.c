@@ -33,6 +33,7 @@ void debug_errframe(CAN_ERR_FRAME_STRUCT *frame);
 //SPI check
 int mcp2515_check_spi();
 
+#define NODE_ROLE 1
 
 #define STARTUP_DELAY_MS 10000
 
@@ -41,7 +42,7 @@ int main() {
     stdio_usb_init();
     sleep_ms(STARTUP_DELAY_MS);
         
-    can_init(REQOP_LOOPBACK);
+    can_init(REQOP_NORMAL);
 
     if (!mcp2515_check_spi()) {
         printf("MCP2515 SPI fout\n");
@@ -61,22 +62,14 @@ int main() {
     
     while (true) {
 
-        tx_frame.id = 0x101;
-        tx_frame.datalen = 1;
-        tx_frame.data[0] = 0xAA;
-        can_tx_extended_data_frame(&tx_frame);
-
-        for (int i = 0; i < 10; i++) {
-            can_poll();
-            sleep_ms(5);
+        if (NODE_ROLE == 1) {
+            tx_frame.id = 0x101;
+            tx_frame.datalen = 2;
+            tx_frame.data[0] = (uint8_t) x;
+            tx_frame.data[1] = (uint8_t) (x >> 8);
+            x++;
+            can_tx_extended_data_frame(&tx_frame);
         }
-
-        tx_frame.id = 0x50;
-        tx_frame.datalen = 2;
-        tx_frame.data[0] = (uint8_t) x;
-        tx_frame.data[1] = (uint8_t) (x >> 8);
-        x++;
-        can_tx_extended_data_frame(&tx_frame);
 
         for (int i = 0; i < 10; i++) {
             can_poll();
@@ -103,6 +96,16 @@ Version : DMK, Initial code
         return;
     }
     debug_dataframe(frame);
+
+    if (NODE_ROLE == 2 && frame->id == 0x101) {
+        CAN_DATA_FRAME_STRUCT tx_frame;
+        tx_frame.id = 0x50;
+        tx_frame.datalen = frame->datalen;
+        for (uint8_t i = 0; i < frame->datalen; i++) {
+            tx_frame.data[i] = frame->data[i];
+        }
+        can_tx_extended_data_frame(&tx_frame);
+    }
 }
 
 /* ***************************************************************************************** */
@@ -219,7 +222,7 @@ Version : DMK, Initial code
 int mcp2515_check_spi()
 {
     uint8_t data = mcp2515_read_register(CANSTAT);
-    if ((data & 0xE0) == 0x40) {
+    if ((data & 0xE0) == 0x00 || (data & 0xE0) == 0x40) {
         return 1;
     } else {
         return 0;
