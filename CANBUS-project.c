@@ -39,11 +39,16 @@ void debug_errframe(CAN_ERR_FRAME_STRUCT *frame);
 //Claxon sensor en claxon ID.
 #define CLAXON_SENSOR_ID 0x599
 #define CLAXON_STATUS_ID 0x733
-//SPI check
+//SPI check. 
 int mcp2515_check_spi();
+#define MCP2515_TEST_REG BFPCTRL
 //
 //We hebben tijd nodig om serial monitor te openen, zodat wij de eerste frames kunnen ontvangen.
 #define STARTUP_DELAY_MS 8000
+
+bool getCanFlag();
+bool getButtonVal();
+void setCanFlag(bool val);
 
 int main() {
 
@@ -65,47 +70,34 @@ int main() {
     can_set_tx_handler(&on_can_tx);
     can_set_err_handler(&on_can_err);
 
-    //Hier wordt de knop ingesteld met interne pull-up
-    if (NODE_ROLE == 1) {
-    gpio_init(CLAXON_KNOP);
-    gpio_set_dir(CLAXON_KNOP, GPIO_IN);
-    gpio_pull_up(CLAXON_KNOP);
-}
-
-    
     while (true) {
 
         if (NODE_ROLE == 1) {
-    static uint8_t prev_knop_status = 0xFF;
-    uint8_t gpio_val = gpio_get(CLAXON_KNOP);
-    uint8_t knop_status = (gpio_val == 0) ? 1 : 0;
+            static uint8_t prev_knop_status = 0xFF;
+            uint8_t knop_status = getButtonVal() ? 1 : 0;
 
-if (knop_status != prev_knop_status) {
+            if (getCanFlag() && knop_status != prev_knop_status) {
 
-    printf("Knop status=%d (gpio=%d)\n", knop_status, gpio_val);
+                printf("Knop status=%d\n", knop_status);
 
-    CAN_DATA_FRAME_STRUCT tx_frame;
-    tx_frame.id = CLAXON_SENSOR_ID;
-    tx_frame.datalen = 1;
-    tx_frame.data[0] = knop_status;
+                CAN_DATA_FRAME_STRUCT tx_frame;
+                tx_frame.id = CLAXON_SENSOR_ID;
+                tx_frame.datalen = 1;
+                tx_frame.data[0] = knop_status;
 
-    int rc = can_tx_extended_data_frame(&tx_frame);
-    printf("can_tx rc=%d, ID=0x%08X, LEN=%d, DATA0=0x%02X\n",
-           rc,
-           (unsigned int)tx_frame.id,
-           tx_frame.datalen,
-           tx_frame.data[0]);
+                int rc = can_tx_extended_data_frame(&tx_frame);
+                printf("can_tx rc=%d, ID=0x%08X, LEN=%d, DATA0=0x%02X\n",
+                       rc,
+                       (unsigned int)tx_frame.id,
+                       tx_frame.datalen,
+                       tx_frame.data[0]);
 
-    prev_knop_status = knop_status;
-}
-
-}
-
-
-        for (int i = 0; i < 10; i++) {
-            can_poll();
-            sleep_ms(5);
+                prev_knop_status = knop_status;
+                setCanFlag(false);
+            }
         }
+
+        sleep_ms(5);
     }
     
 }
@@ -123,17 +115,26 @@ notes   :
 Version : DMK, Initial code
 ***************************************************************** */
 {
-    if (NODE_ROLE != 2 || frame->id != CLAXON_SENSOR_ID || frame->datalen == 0) {
-        return;
+   if (NODE_ROLE == 2) {
+        if (frame->id != CLAXON_SENSOR_ID || frame->datalen == 0) {
+            return;
+        }
+
+        debug_dataframe(frame);  // laat 0x599 met 0x00/0x01 zien
+
+        CAN_DATA_FRAME_STRUCT tx_frame;
+        tx_frame.id = CLAXON_STATUS_ID;
+        tx_frame.datalen = 1;
+        tx_frame.data[0] = frame->data[0];
+        can_tx_extended_data_frame(&tx_frame);
+
+    } else if (NODE_ROLE == 1) {
+        if (frame->id != CLAXON_STATUS_ID || frame->datalen == 0) {
+            return;
+        }
+
+        debug_dataframe(frame);
     }
-
-    debug_dataframe(frame);  // laat 0x599 met 0x00/0x01 zien
-
-    CAN_DATA_FRAME_STRUCT tx_frame;
-    tx_frame.id = CLAXON_STATUS_ID;
-    tx_frame.datalen = 1;
-    tx_frame.data[0] = frame->data[0];
-    can_tx_extended_data_frame(&tx_frame);
 }
 
 /* ***************************************************************************************** */
@@ -249,10 +250,24 @@ Version : DMK, Initial code
 }
 int mcp2515_check_spi()
 {
-    uint8_t data = mcp2515_read_register(CANSTAT);
-    if ((data & 0xE0) == 0x00 || (data & 0xE0) == 0x40) {
-        return 1;
+    // Lees de oorspronkelijke waarde van het testregister
+    uint8_t orig = mcp2515_read_register(MCP2515_TEST_REG);
+
+    // Schrijf een testpatroon
+    mcp2515_write_register(MCP2515_TEST_REG, 0x55);
+    uint8_t a = mcp2515_read_register(MCP2515_TEST_REG);
+
+    // Zet de oude waarde netjes terug
+    mcp2515_write_register(MCP2515_TEST_REG, orig);
+
+    // Debug, één keer bij opstart
+    printf("SPI-test: orig=0x%02X a=0x%02X\n", orig, a);
+
+    // Als SPI werkt, verandert het register naar 0x05 (meestal ≠ orig)
+    // Als SPI kapot is, blijft a gelijk aan orig (0x00 of 0xFF of iets anders)
+    if (a == orig) {
+        return 0;   // fout
     } else {
-        return 0;
+        return 1;   // oké
     }
 }

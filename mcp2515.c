@@ -33,6 +33,7 @@ v1.1    2023-10-17: Added rx, tx en err callback functions
 #include "mcp2515.h"
 
 #define MCP2515_INT_PIN 21   // Pico GPIO 21 = pin 27
+#define CLAXON_KNOP 2
 
 static inline void spi_cs_select();
 static inline void spi_cs_deselect();
@@ -41,6 +42,24 @@ static inline void spi_cs_deselect();
 void (*can_rx_fp)(CAN_DATA_FRAME_STRUCT *) = NULL;
 void (*can_tx_fp)(CAN_DATA_FRAME_STRUCT *) = NULL;
 void (*can_err_fp)(CAN_ERR_FRAME_STRUCT *) = NULL;
+
+volatile bool sendCanFlag = false;
+volatile bool buttonVal = false;
+
+bool getButtonVal()
+{
+    return buttonVal;
+}
+
+bool getCanFlag()
+{
+    return sendCanFlag;
+}
+
+void setCanFlag(bool val)
+{
+    sendCanFlag = val;
+}
 
 /* ************************************************************** */
 void can_init(uint8_t mode)
@@ -60,7 +79,6 @@ void can_init(uint8_t mode)
     // Make the CS pin available to picotool
     bi_decl(bi_1pin_with_name(PICO_DEFAULT_SPI_CSN_PIN, "spi CS"));
 
-    // Setup interrupt handler for mcp2515 interrupts (INT active-low)
     gpio_init(MCP2515_INT_PIN);
     gpio_set_dir(MCP2515_INT_PIN, GPIO_IN);
     gpio_pull_up(MCP2515_INT_PIN);
@@ -71,6 +89,11 @@ void can_init(uint8_t mode)
         true,
         &mcp2515_callback
     );
+
+    gpio_init(CLAXON_KNOP);
+    gpio_set_dir(CLAXON_KNOP, GPIO_IN);
+    gpio_pull_up(CLAXON_KNOP);
+    gpio_set_irq_enabled(CLAXON_KNOP, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true);
 
     // Init mcp2515
     mcp2515_init(mode);
@@ -91,33 +114,25 @@ uint8_t can_tx_extended_data_frame(CAN_DATA_FRAME_STRUCT *frame)
     } else if (!(status & 0x40)) {
         tx_buf_id = 0x02;
     } else {
-        err = 1; // no free transmit slot
+        err = 1;
     }
 
-    // If a free transmitterbuffer is available
     if (0 == err) {
-                
-        // Temp transmitbuffer and make sure lenght <= 8
         uint8_t buf[14];
         uint8_t datalen = frame->datalen <= 8 ? frame->datalen : 8;
 
-        // Construct buffer content for extended id
-        buf[0] = (uint8_t)((frame->id << 3) >> 24);                                   // TXBnSIDH
+        buf[0] = (uint8_t)((frame->id << 3) >> 24);
         buf[1] = (uint8_t)((((frame->id << 3) | (frame->id & 0x00030000)) >> 16)
-                           | EXIDE);                                                  // TXBnSIDL
-        buf[2] = frame->id >> 8;                                                      // TXBnEID8      
-        buf[3] = frame->id;                                                           // TXBnEID0
-        buf[4] = datalen;                                                             // TXBnDLC and RTR bit clear
+                           | EXIDE);
+        buf[2] = frame->id >> 8;
+        buf[3] = frame->id;
+        buf[4] = datalen;
     
-        // TBnDm
         for (uint8_t idx = 0; idx < datalen; idx++) {
             buf[5 + idx] = frame->data[idx];
         }
     
-        // Write to CAN controller
         mcp2515_load_tx_buffer(tx_buf_id, buf, 13);
-    
-        // ... and request transmit
         mcp2515_RTS(tx_buf_id);
     } else {
         printf("Error finding free transmitbuffer\n");
@@ -154,30 +169,22 @@ void can_set_err_handler( void (*f)(CAN_ERR_FRAME_STRUCT *) )
 /* ************************************************************** */
 void mcp2515_init(uint8_t mode) 
 {
-    // Reset CAN controller
     mcp2515_reset();
     sleep_ms(10);
 
-    // Clear masks RX messages
     mcp2515_write_register(RXM0SIDH, 0x00);
     mcp2515_write_register(RXM0SIDL, 0x00);
     mcp2515_write_register(RXM0EID8, 0x00);
     mcp2515_write_register(RXM0EID0, 0x00);
 
-    // Set CNF1 (250kbps)
     mcp2515_write_register(CNF1, 0x00);
-    // Set CNF2
     mcp2515_write_register(CNF2, 0xB1);
-    // Set CNF3
     mcp2515_write_register(CNF3, 0x85);
 
-    // Interrupts on rx buffers and errors
     mcp2515_write_register(CANINTE, MERRE | ERRIE | RX1IE | RX0IE); 
 
-    // Set mode (REQOP_NORMAL or REQOP_LOOPBACK for development)
     mcp2515_write_register(CANCTRL, mode);
 
-    // Verify mode
     uint8_t dummy = mcp2515_read_register(CANSTAT);
     if (mode != (dummy & 0xE0)) {
         printf("Error setting mode!\n");
@@ -186,53 +193,43 @@ void mcp2515_init(uint8_t mode)
 }
 
 /* ************************************************************** */
-// Centrale handler: wordt gebruikt door interrupt én polling
 static void mcp2515_handle_interrupt_status(uint8_t status)
 {
     uint8_t buf[14];
 
-    // Check for RX0 and RX1 interrupts
     if ((status & RX0IF) || (status & RX1IF)) {
 
-        // Read MCP2515 RX buffer
         if (status & RX0IF) {
             mcp2515_read_rx_buffer(0, buf, 14);
         } else if (status & RX1IF) {
             mcp2515_read_rx_buffer(1, buf, 14);
         }
 
-        // Prepare CAN_DATA_FRAME
         CAN_DATA_FRAME_STRUCT frame;        
         
         if (buf[1] & 0x08) {
-            // Extended ID
             uint8_t b3 = (buf[0] >> 3);  
             uint8_t b2 = (buf[0] << 5) | ((buf[1] & 0xE0) >> 3) | (buf[1] & 0x03);
             uint8_t b1 = buf[2];
             uint8_t b0 = buf[3];
             frame.id = (uint32_t)b3 << 24 | (uint32_t)b2 << 16 | (uint32_t)b1 << 8 | b0;
         } else {
-            // Standard ID (11 bits)
             uint8_t sidh = buf[0];
             uint8_t sidl = buf[1];
             frame.id = ((uint16_t)sidh << 3) | (sidl >> 5);
         }
         
-        // Get datalenght (clip to max. 8 bytes) 
         frame.datalen = (buf[4] & 0x0F) <= 8 ? (buf[4] & 0x0F) : 8;
         
-        // Get actual data
         for (uint8_t idx = 0; idx < frame.datalen; idx++) {
            frame.data[idx] = buf[5 + idx];
         }
         
-        // Inform caller
         if (can_rx_fp != NULL) {
             can_rx_fp(&frame);
         }
     }
 
-    // Error-info doorgeven (als er iets in EFLG staat)
     uint8_t eflg = mcp2515_read_register(EFLG);
     if (eflg != 0 && can_err_fp != NULL) {
         CAN_ERR_FRAME_STRUCT err;
@@ -243,7 +240,6 @@ static void mcp2515_handle_interrupt_status(uint8_t status)
         can_err_fp(&err);
     }
 
-    // Flags wissen: CANINTF en EFLG leegmaken
     mcp2515_bit_modify(CANINTF, 0xFF, 0x00);
     mcp2515_bit_modify(EFLG,   0xFF, 0x00);
 }
@@ -251,19 +247,23 @@ static void mcp2515_handle_interrupt_status(uint8_t status)
 /* ************************************************************** */
 void mcp2515_callback(uint gpio, uint32_t events)
 {
-    (void)gpio;
-    (void)events;
-
-    uint8_t status = mcp2515_read_register(CANINTF);
-    // Debug eventueel:
-    // printf("[INT] mcp2515_callback CANINTF=0x%02X\n", status);
-    if (status != 0) {
-        mcp2515_handle_interrupt_status(status);
+    if (gpio == MCP2515_INT_PIN) {
+        uint8_t status = mcp2515_read_register(CANINTF);
+        if (status != 0) {
+            mcp2515_handle_interrupt_status(status);
+        }
+    } else if (gpio == CLAXON_KNOP) {
+        if (events & GPIO_IRQ_EDGE_FALL) {
+            buttonVal = true;
+            sendCanFlag = true;
+        } else if (events & GPIO_IRQ_EDGE_RISE) {
+            buttonVal = false;
+            sendCanFlag = true;
+        }
     }
 }
 
 /* ************************************************************** */
-// Polling-variant: aanroepen vanuit main-loop
 void can_poll(void)
 {
     uint8_t status = mcp2515_read_register(CANINTF);
