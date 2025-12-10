@@ -33,9 +33,6 @@ void debug_errframe(CAN_ERR_FRAME_STRUCT *frame);
 //Node_Role 1 is de zender, Node_Role 2 de ontvanger.
 #define NODE_ROLE 1
 //
-// Definieer de digitale ingang voor de knop.
-#define CLAXON_KNOP 2
-//
 //Claxon sensor en claxon ID.
 #define CLAXON_SENSOR_ID 0x599
 #define CLAXON_STATUS_ID 0x733
@@ -57,11 +54,15 @@ int main() {
         
     can_init(REQOP_NORMAL);
 
-    if (!mcp2515_check_spi()) {
-        printf("MCP2515 SPI fout\n");
-        while (true) {
-            sleep_ms(1000);
-        }
+    // Nieuwe variabelen voor periodieke SPI-check en herstel.
+    absolute_time_t next_spi_check = make_timeout_time_ms(1000);
+    bool spi_error = false;
+
+    // Initiale SPI-test; bij fout in 'spi_error' blijven we proberen te herstellen.
+    int spi_ok = mcp2515_check_spi();
+    if (!spi_ok) {
+        printf("MCP2515 SPI fout bij opstart\n");
+        spi_error = true;
     }
 
     debug_config();
@@ -95,6 +96,28 @@ int main() {
                 prev_knop_status = knop_status;
                 setCanFlag(false);
             }
+        }
+
+        // Periodieke SPI-test en eventueel herinitialiseren MCP2515.
+        if (absolute_time_diff_us(get_absolute_time(), next_spi_check) <= 0) {
+            int ok = mcp2515_check_spi();
+            if (!ok) {
+                if (!spi_error) {
+                    printf("MCP2515 SPI fout\n");
+                    spi_error = true;
+                }
+            } else {
+                if (spi_error) {
+                    printf("MCP2515 SPI hersteld, CAN init\n");
+                    can_init(REQOP_NORMAL);
+                    can_set_rx_handler(&on_can_rx);
+                    can_set_tx_handler(&on_can_tx);
+                    can_set_err_handler(&on_can_err);
+                    debug_config();
+                    spi_error = false;
+                }
+            }
+            next_spi_check = make_timeout_time_ms(1000);
         }
 
         sleep_ms(5);
@@ -261,7 +284,7 @@ int mcp2515_check_spi()
     mcp2515_write_register(MCP2515_TEST_REG, orig);
 
     // Debug, één keer bij opstart
-    printf("SPI-test: orig=0x%02X a=0x%02X\n", orig, a);
+    //printf("SPI-test: orig=0x%02X a=0x%02X\n", orig, a);
 
     // Als SPI werkt, verandert het register naar 0x05 (meestal ≠ orig)
     // Als SPI kapot is, blijft a gelijk aan orig (0x00 of 0xFF of iets anders)
