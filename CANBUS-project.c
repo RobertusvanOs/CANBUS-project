@@ -31,7 +31,7 @@ void debug_dataframe(CAN_DATA_FRAME_STRUCT *frame);
 void debug_errframe(CAN_ERR_FRAME_STRUCT *frame); 
 //
 //Node_Role 1 is de zender, Node_Role 2 de ontvanger.
-#define NODE_ROLE 1
+#define NODE_ROLE 2
 //
 //Claxon sensor en claxon ID.
 #define CLAXON_SENSOR_ID 0x599
@@ -42,6 +42,20 @@ int mcp2515_check_spi();
 //
 //We hebben tijd nodig om serial monitor te openen, zodat wij de eerste frames kunnen ontvangen.
 #define STARTUP_DELAY_MS 8000
+
+// Heartbeat-instellingen.
+#define HEARTBEAT_BASE_ID      0x700
+#define HEARTBEAT_INTERVAL_MS  1000
+#define HEARTBEAT_TIMEOUT_MS   1500
+
+// Heartbeat-status.
+absolute_time_t next_heartbeat;
+absolute_time_t last_rx_heartbeat;
+bool peer_online = false;
+
+// Foutstatus.
+bool node_offbus = false;
+bool error_reported = false;
 
 bool getCanFlag();
 bool getButtonVal();
@@ -67,13 +81,20 @@ int main() {
 
     debug_config();
 
+    // Heartbeat timers initialiseren.
+    next_heartbeat = make_timeout_time_ms(HEARTBEAT_INTERVAL_MS);
+    last_rx_heartbeat = get_absolute_time();
+    peer_online = false;
+    node_offbus = false;
+    error_reported = false;
+
     can_set_rx_handler(&on_can_rx);
     can_set_tx_handler(&on_can_tx);
     can_set_err_handler(&on_can_err);
 
     while (true) {
 
-        if (NODE_ROLE == 1) {
+        if (NODE_ROLE == 1 && !node_offbus) {   // alleen zender blokkeert op node_offbus
             static uint8_t prev_knop_status = 0xFF;
             uint8_t knop_status = getButtonVal() ? 1 : 0;
 
@@ -95,6 +116,35 @@ int main() {
 
                 prev_knop_status = knop_status;
                 setCanFlag(false);
+            }
+        }
+
+        // Heartbeat verzenden.
+        // Bij NODE_ROLE 1 stoppen we bij node_offbus; ontvanger blijft altijd sturen.
+        bool hb_blocked = (NODE_ROLE == 1 && node_offbus);   // aanpassing
+        if (!hb_blocked &&
+            absolute_time_diff_us(get_absolute_time(), next_heartbeat) <= 0) {
+
+            CAN_DATA_FRAME_STRUCT hb;
+            hb.id = HEARTBEAT_BASE_ID + NODE_ROLE;
+            hb.datalen = 1;
+            hb.data[0] = 0xAA;
+            can_tx_extended_data_frame(&hb);
+
+            next_heartbeat = make_timeout_time_ms(HEARTBEAT_INTERVAL_MS);
+        }
+
+        // Heartbeat-timeout: andere node niet meer zichtbaar.
+        if (peer_online &&
+            absolute_time_diff_us(last_rx_heartbeat, get_absolute_time()) >
+                (HEARTBEAT_TIMEOUT_MS * 1000)) {
+
+            printf("Node niet meer zichtbaar op de bus\n");
+            peer_online = false;
+
+            if (NODE_ROLE == 1) {          // alleen zender in foutstatus zetten
+                node_offbus = true;
+                error_reported = true;
             }
         }
 
@@ -138,6 +188,31 @@ notes   :
 Version : DMK, Initial code
 ***************************************************************** */
 {
+    // Heartbeat van andere node herkennen en eventueel herstel uitvoeren.
+    uint32_t expected_hb = HEARTBEAT_BASE_ID + (NODE_ROLE == 1 ? 2 : 1);
+    if (frame->id == expected_hb) {
+        last_rx_heartbeat = get_absolute_time();
+
+        if (node_offbus && NODE_ROLE == 1) {       // herstel alleen relevant voor zender
+            printf("Node zichtbaar op de bus\n");
+            can_init(REQOP_NORMAL);
+            can_set_rx_handler(&on_can_rx);
+            can_set_tx_handler(&on_can_tx);
+            can_set_err_handler(&on_can_err);
+            debug_config();
+
+            node_offbus = false;
+            error_reported = false;
+            peer_online = true;
+        } else {
+            if (!peer_online) {
+                printf("Node zichtbaar op de bus\n");
+            }
+            peer_online = true;
+        }
+        return;
+    }
+
    if (NODE_ROLE == 2) {
         if (frame->id != CLAXON_SENSOR_ID || frame->datalen == 0) {
             return;
@@ -184,9 +259,16 @@ notes   :
 Version : DMK, Initial code
 ***************************************************************** */
 {
-    puts(">> on_can_err()");
-    debug_errframe(err);
-    puts("<< on_can_err()");
+    // Eénmalige foutmelding en éénmalige err-debug.
+    if (!error_reported) {
+        printf("FOUT: CAN-bus of andere node\n");
+        debug_errframe(err);
+
+        if (NODE_ROLE == 1) {        // ontvanger blijft ‘online’; zender gaat off-bus
+            node_offbus = true;
+        }
+        error_reported = true;
+    }
 }
 
 
