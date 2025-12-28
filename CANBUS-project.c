@@ -32,7 +32,7 @@ void debug_dataframe(CAN_DATA_FRAME_STRUCT *frame);
 void debug_errframe(CAN_ERR_FRAME_STRUCT *frame); 
 //
 //Node_Role 1 is de zender, Node_Role 2 de ontvanger.
-#define NODE_ROLE 1
+#define NODE_ROLE 2
 //
 //Claxon sensor en claxon ID.
 #define CLAXON_SENSOR_ID 0x599
@@ -46,6 +46,9 @@ void debug_errframe(CAN_ERR_FRAME_STRUCT *frame);
 
 // Debounce tijd (microseconden)
 #define KNOP_DEBOUNCE_US 20000u   // 20 ms
+
+// Claxon cyclisch herhalen (ms) zodat een “domme” ontvanger blijft volgen
+#define CLAXON_CYCLIC_MS 50
 
 //SPI check. 
 int mcp2515_check_spi();
@@ -85,6 +88,12 @@ bool getButtonVal()
     return buttonVal;
 }
 
+static inline uint8_t knop_status_from_pin(void)
+{
+    // pull-up: los = 1, ingedrukt = 0  -> status: ingedrukt=1, los=0
+    return (gpio_get(CLAXON_KNOP) == 0) ? 1 : 0;
+}
+
 // ---- GPIO IRQ handler “haakje” vanuit mcp2515.c ----
 void can_set_gpio_irq_handler(void (*f)(uint gpio, uint32_t events));
 
@@ -93,26 +102,16 @@ void app_gpio_irq_handler(uint gpio, uint32_t events)
 {
     if (gpio == CLAXON_KNOP) {
 
-        // GPIO_IRQ_EDGE_FALL = knop ingedrukt (pull-up) -> level=1
-        // GPIO_IRQ_EDGE_RISE = knop los -> level=0
-        uint8_t level;
-        if (events & GPIO_IRQ_EDGE_FALL) {
-            level = 1;
-        } else if (events & GPIO_IRQ_EDGE_RISE) {
-            level = 0;
-        } else {
+        // Laat main de pin debouncen; ISR alleen light-weight (en rate limited)
+        static uint32_t last_irq_us = 0;
+        uint32_t now_us = time_us_32();
+        if ((uint32_t)(now_us - last_irq_us) < 500u) {
             return;
         }
+        last_irq_us = now_us;
 
-        buttonVal = (level != 0);
-
-        button_event_t ev;
-        ev.level = level;
-        ev.t_us = time_us_32();
-
-        if (!queue_try_add(&button_queue, &ev)) {
-            button_queue_overflow++;
-        }
+        (void)events;
+        buttonVal = (gpio_get(CLAXON_KNOP) == 0);
     }
 }
 
@@ -168,34 +167,62 @@ int main() {
 
     uint8_t prev_knop_status = 0xFF;
 
-    // Debounce state
-    static uint32_t last_edge_us = 0;
+    // Claxon cyclisch zenden
+    uint8_t claxon_state = 0;
+    absolute_time_t next_claxon_tx = make_timeout_time_ms(CLAXON_CYCLIC_MS);
+
+    // Pin-waarheid debounce state (ruwe verandering + stabiele status)
+    uint32_t raw_change_us = time_us_32();
+    uint8_t raw_pin_status = knop_status_from_pin();
+    uint8_t stable_pin_status = raw_pin_status;
+
+    // Start cyclisch met de actuele (stabiele) knopstand
+    claxon_state = stable_pin_status;
+    prev_knop_status = stable_pin_status;
 
     while (true) {
 
         can_poll();
 
-        // Verwerk ALLE knop-events (edge sensitive + geen verloren transitions)
+        // ZENDER: pin-waarheid + stabiele debounce + edge + cyclisch herhalen
         if (NODE_ROLE == 1 && !node_offbus) {
+
+            // Drain queue (we gebruiken de pin als waarheid)
             button_event_t ev;
-            while (queue_try_remove(&button_queue, &ev)) {
+            while (queue_try_remove(&button_queue, &ev)) { }
 
-                // Debounce: negeer edges die te snel na elkaar komen
-                if ((uint32_t)(ev.t_us - last_edge_us) < KNOP_DEBOUNCE_US) {
-                    continue;
-                }
-                last_edge_us = ev.t_us;
+            uint32_t now_us = time_us_32();
+            uint8_t pin_status = knop_status_from_pin();     // 0/1 (1 = ingedrukt)
 
-                uint8_t knop_status = ev.level ? 1 : 0;
+            // buttonVal up-to-date houden (optioneel)
+            buttonVal = (pin_status != 0);
 
-                if (knop_status != prev_knop_status) {
+            // Ruwe verandering detecteren
+            if (pin_status != raw_pin_status) {
+                raw_pin_status = pin_status;
+                raw_change_us = now_us;
+            }
 
-                    printf("Knop status=%d t_us=%lu\n", knop_status, (unsigned long)ev.t_us);
+            // Pas bij stabiel niveau gedurende KNOP_DEBOUNCE_US nemen we hem als “echte” status
+            if (raw_pin_status != stable_pin_status &&
+                (uint32_t)(now_us - raw_change_us) >= KNOP_DEBOUNCE_US) {
+
+                stable_pin_status = raw_pin_status;
+
+                if (stable_pin_status != prev_knop_status) {
+
+                    // Bewaar actuele status voor cyclisch zenden
+                    claxon_state = stable_pin_status;
+
+                    // Alleen bij stabiele edge printen
+                    printf("Knop status=%u t_us=%lu\n",
+                           (unsigned)stable_pin_status,
+                           (unsigned long)now_us);
 
                     CAN_DATA_FRAME_STRUCT tx_frame;
                     tx_frame.id = CLAXON_SENSOR_ID;
                     tx_frame.datalen = 1;
-                    tx_frame.data[0] = knop_status;
+                    tx_frame.data[0] = stable_pin_status;
 
                     int rc = can_tx_extended_data_frame(&tx_frame);
                     printf("can_tx rc=%d, ID=0x%08X, LEN=%d, DATA0=0x%02X\n",
@@ -204,21 +231,31 @@ int main() {
                            tx_frame.datalen,
                            tx_frame.data[0]);
 
-                    prev_knop_status = knop_status;
+                    prev_knop_status = stable_pin_status;
+
+                    // Na een edge: cyclische timer opnieuw laten starten
+                    next_claxon_tx = make_timeout_time_ms(CLAXON_CYCLIC_MS);
                 }
             }
 
-            // Optioneel: melding als queue overflowt (1x per loop is zat)
-            static uint32_t prev_overflow = 0;
-            uint32_t now_overflow = button_queue_overflow;
-            if (now_overflow != prev_overflow) {
-                printf("WAARSCHUWING: button_queue overflow=%lu\n", (unsigned long)now_overflow);
-                prev_overflow = now_overflow;
+            // Cyclisch herhalen (zonder printf)
+            if (absolute_time_diff_us(get_absolute_time(), next_claxon_tx) <= 0) {
+                CAN_DATA_FRAME_STRUCT tx_frame;
+                tx_frame.id = CLAXON_SENSOR_ID;
+                tx_frame.datalen = 1;
+                tx_frame.data[0] = claxon_state;
+                can_tx_extended_data_frame(&tx_frame);
+
+                next_claxon_tx = make_timeout_time_ms(CLAXON_CYCLIC_MS);
             }
+
         } else {
             // Als zender offbus is: queue leegtrekken zodat je geen oude events verstuurt bij herstel
             button_event_t drop;
             while (queue_try_remove(&button_queue, &drop)) { }
+
+            // Als zender offbus is: cyclisch zenden pauzeren (geen extra busload)
+            next_claxon_tx = make_timeout_time_ms(CLAXON_CYCLIC_MS);
         }
 
         // Heartbeat verzenden.
@@ -329,8 +366,6 @@ Version : DMK, Initial code
         // Led volgt de daadwerkelijke claxon-aanvraag die binnenkomt.
         gpio_put(CLAXON_LED, frame->data[0] ? 1 : 0);
 
-        debug_dataframe(frame);  // laat 0x599 met 0x00/0x01 zien
-
         CAN_DATA_FRAME_STRUCT tx_frame;
         tx_frame.id = CLAXON_STATUS_ID;
         tx_frame.datalen = 1;
@@ -344,8 +379,6 @@ Version : DMK, Initial code
 
         // Optioneel: op zender kun je ook de led laten volgen op status.
         gpio_put(CLAXON_LED, frame->data[0] ? 1 : 0);
-
-        debug_dataframe(frame);
     }
 }
 
@@ -359,8 +392,7 @@ notes   :
 Version : DMK, Initial code
 ***************************************************************** */
 {
-    puts(">> can_tx()");
-    puts("<< can_tx()");
+    (void)frame;
 }
 
 /* ***************************************************************************************** */
@@ -479,9 +511,6 @@ int mcp2515_check_spi()
 
     // Zet de oude waarde netjes terug
     mcp2515_write_register(MCP2515_TEST_REG, orig);
-
-    // Debug, één keer bij opstart
-    //printf("SPI-test: orig=0x%02X a=0x%02X\n", orig, a);
 
     // Als SPI werkt, verandert het register naar 0x05 (meestal ≠ orig)
     // Als SPI kapot is, blijft a gelijk aan orig (0x00 of 0xFF of iets anders)
