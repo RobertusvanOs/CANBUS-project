@@ -194,19 +194,20 @@ static void mcp2515_handle_interrupt_status(uint8_t status)
     if (status & RX0IF) {
         mcp2515_read_rx_buffer(0, buf, 14);
 
-        CAN_DATA_FRAME_STRUCT frame;        
+        CAN_DATA_FRAME_STRUCT frame = {0};
         
-        if (buf[1] & 0x08) {
-            uint8_t b3 = (buf[0] >> 3);  
-            uint8_t b2 = (buf[0] << 5) | ((buf[1] & 0xE0) >> 3) | (buf[1] & 0x03);
-            uint8_t b1 = buf[2];
-            uint8_t b0 = buf[3];
-            frame.id = (uint32_t)b3 << 24 | (uint32_t)b2 << 16 | (uint32_t)b1 << 8 | b0;
-        } else {
-            uint8_t sidh = buf[0];
-            uint8_t sidl = buf[1];
-            frame.id = ((uint16_t)sidh << 3) | (sidl >> 5);
-        }
+        
+        if (buf[1] & 0x08) { // extended
+    frame.id =
+        ((uint32_t)buf[0] << 21) |
+        ((uint32_t)(buf[1] & 0xE0) << 13) |
+        ((uint32_t)(buf[1] & 0x03) << 16) |
+        ((uint32_t)buf[2] << 8)  |
+         (uint32_t)buf[3];
+} else { // standard
+    frame.id = ((uint16_t)buf[0] << 3) | (buf[1] >> 5);
+}
+
         
         frame.datalen = (buf[4] & 0x0F) <= 8 ? (buf[4] & 0x0F) : 8;
         
@@ -223,19 +224,20 @@ static void mcp2515_handle_interrupt_status(uint8_t status)
     if (status & RX1IF) {
         mcp2515_read_rx_buffer(1, buf, 14);
 
-        CAN_DATA_FRAME_STRUCT frame;        
+        CAN_DATA_FRAME_STRUCT frame = {0};
         
-        if (buf[1] & 0x08) {
-            uint8_t b3 = (buf[0] >> 3);  
-            uint8_t b2 = (buf[0] << 5) | ((buf[1] & 0xE0) >> 3) | (buf[1] & 0x03);
-            uint8_t b1 = buf[2];
-            uint8_t b0 = buf[3];
-            frame.id = (uint32_t)b3 << 24 | (uint32_t)b2 << 16 | (uint32_t)b1 << 8 | b0;
-        } else {
-            uint8_t sidh = buf[0];
-            uint8_t sidl = buf[1];
-            frame.id = ((uint16_t)sidh << 3) | (sidl >> 5);
-        }
+        
+        if (buf[1] & 0x08) { // extended
+    frame.id =
+        ((uint32_t)buf[0] << 21) |
+        ((uint32_t)(buf[1] & 0xE0) << 13) |
+        ((uint32_t)(buf[1] & 0x03) << 16) |
+        ((uint32_t)buf[2] << 8)  |
+         (uint32_t)buf[3];
+} else { // standard
+    frame.id = ((uint16_t)buf[0] << 3) | (buf[1] >> 5);
+}
+
         
         frame.datalen = (buf[4] & 0x0F) <= 8 ? (buf[4] & 0x0F) : 8;
         
