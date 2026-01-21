@@ -6,8 +6,14 @@ Basic MCP2515 CAN application. Rx and Tx of CAN frames
 
 v1.0    2023-10-10: Initial code
 v1.1    2023-12-04: Added filtering example
+v2.0    2026-1-21: Testopstelling door R. van Os en G. Lassche
 
 ***************************************************/
+
+//Aan: cycling zenden, Uit: Een aantal keer bevestigen, DONE
+//ACK: uit de code halen. 
+//Ontvanger: 250ms geen signaal = claxon uit. 
+//Heartbeat optioneel toevoegen. DONE
 
 #include "stdio.h"
 #include "stdlib.h"
@@ -33,8 +39,8 @@ void debug_dataframe(CAN_DATA_FRAME_STRUCT *frame);
 void debug_errframe(CAN_ERR_FRAME_STRUCT *frame); 
 //
 //Node_Role 1 is de zender, Node_Role 2 de ontvanger.
-#define NODE_ROLE 2
-#define ENABLE_HEARTBEAT   0   // set to 0 to disable
+#define NODE_ROLE 1
+#define ENABLE_HEARTBEAT   1   // set to 0 to disable
 //
 //Claxon sensor en claxon ID.
 #define CLAXON_SENSOR_ID 0x599
@@ -51,6 +57,7 @@ void debug_errframe(CAN_ERR_FRAME_STRUCT *frame);
 
 // Claxon cyclisch herhalen (ms) zodat een “domme” ontvanger blijft volgen
 #define CLAXON_CYCLIC_MS 50
+uint8_t cyclish_uit_teller = 0;
 
 //SPI check. 
 int mcp2515_check_spi();
@@ -67,6 +74,9 @@ int mcp2515_check_spi();
 // Herstel zonder heartbeat (ms)
 #define CAN_RECOVER_INTERVAL_MS 1000
 
+// Failsafe ontvanger (role 2): 250ms geen claxonframe = claxon uit
+#define FAILSAFE_TIMEOUT_MS 250
+
 #if ENABLE_HEARTBEAT
 // Heartbeat-status.
 absolute_time_t next_heartbeat;
@@ -77,6 +87,11 @@ bool peer_online = false;
 // Foutstatus.
 bool node_offbus = false;
 bool error_reported = false;
+
+// ---- Receiver failsafe state (role 2) ----
+static absolute_time_t last_rx_claxon;
+static bool claxon_output = false;
+static bool failsafe_tripped = false;
 
 // ---- Knop events via queue (voorkomt verloren edges) ----
 typedef struct {
@@ -89,7 +104,6 @@ static volatile uint32_t button_queue_overflow = 0;
 
 static inline bool knop_status_from_pin(void)
 {
-    // pull-up: los = 1, ingedrukt = 0  -> status: ingedrukt=1, los=0
     return (gpio_get(CLAXON_KNOP) == 0) ? 1 : 0;
 }
 
@@ -102,16 +116,17 @@ void app_gpio_irq_handler(uint gpio, uint32_t events)
     if (gpio == CLAXON_KNOP) {
         button_event_t evt = {
             .t_us   = time_us_32(),
-            .state  = gpio_get(CLAXON_KNOP)
+            .state  = knop_status_from_pin()
         };
         queue_try_add(&button_queue, &evt);
     }
 }
 
-static inline void report_peer_missing_once(void)
+// ---- 1x melden helper ----
+static inline void report_once(const char *msg)
 {
     if (!error_reported) {
-        printf("Node niet meer zichtbaar op de bus\n");
+        printf("%s\n", msg);
         error_reported = true;
     }
 }
@@ -162,6 +177,12 @@ int main() {
     int last_rc = 0;
     CAN_DATA_FRAME_STRUCT last_tx_frame_printed = {0};
 
+    // Receiver failsafe init (role 2)
+    last_rx_claxon = get_absolute_time();
+    claxon_output = false;
+    failsafe_tripped = false;
+    gpio_put(CLAXON_LED, 0);
+
     // Initiale SPI-test; bij fout in 'spi_error' blijven we proberen te herstellen.
     int spi_ok = mcp2515_check_spi();
     if (!spi_ok) {
@@ -173,6 +194,7 @@ int main() {
 
     #if ENABLE_HEARTBEAT
     // Heartbeat timers initialiseren.
+    // (SPI-check is hierboven al als eerste gedaan)
     next_heartbeat = make_timeout_time_ms(HEARTBEAT_INTERVAL_MS);
     last_rx_heartbeat = get_absolute_time();
     peer_online = false;
@@ -193,6 +215,25 @@ int main() {
 
     while (true) {
         can_poll();
+
+        // FAILSAFE role 2: geen claxonframes binnen FAILSAFE_TIMEOUT_MS => claxon uit
+        if (NODE_ROLE == 2 && claxon_output) {
+            if (absolute_time_diff_us(last_rx_claxon, get_absolute_time()) >
+                (FAILSAFE_TIMEOUT_MS * 1000)) {
+
+                gpio_put(CLAXON_LED, 0);
+                claxon_output = false;
+
+                if (!failsafe_tripped) {
+                    CAN_DATA_FRAME_STRUCT tx_frame;
+                    tx_frame.id = CLAXON_STATUS_ID;
+                    tx_frame.datalen = 1;
+                    tx_frame.data[0] = 0;
+                    can_tx_extended_data_frame(&tx_frame);
+                    failsafe_tripped = true;
+                }
+            }
+        }
 
         // Herstel zonder heartbeat: zender terug laten komen, maar NIET opnieuw foutmelding armeren.
         #if !ENABLE_HEARTBEAT
@@ -226,7 +267,7 @@ int main() {
             if (queue_try_remove(&button_queue, &ev)) {
                 if ((uint32_t)(ev.t_us - last_accepted_us) > KNOP_DEBOUNCE_US) {
                     last_accepted_us = ev.t_us;
-                    claxon_state = (ev.state == 0); // active-low knop
+                    claxon_state = ev.state;
 
                     // BRACE-FIX: alleen zenden als debounce is geaccepteerd
                     CAN_DATA_FRAME_STRUCT tx_frame;
@@ -240,16 +281,29 @@ int main() {
 
                     //Na een edge: cyclische timer resetten
                     next_claxon_tx = make_timeout_time_ms(CLAXON_CYCLIC_MS);
+                    cyclish_uit_teller = 0; //teller resetten voor cyclish-uit signaal
                 }
             }
 
             // Cyclisch herhalen (zonder printf)
             if (absolute_time_diff_us(get_absolute_time(), next_claxon_tx) <= 0) {
-                CAN_DATA_FRAME_STRUCT tx_frame;
-                tx_frame.id = CLAXON_SENSOR_ID;
-                tx_frame.datalen = 1;
-                tx_frame.data[0] = claxon_state;
-                (void)can_tx_extended_data_frame(&tx_frame);
+                if(claxon_state)
+                { //Alleen cyclish aan signaal sturen.
+                    CAN_DATA_FRAME_STRUCT tx_frame;
+                    tx_frame.id = CLAXON_SENSOR_ID;
+                    tx_frame.datalen = 1;
+                    tx_frame.data[0] = claxon_state;
+                    (void)can_tx_extended_data_frame(&tx_frame);
+                }
+                else if (cyclish_uit_teller < 5) {
+                    CAN_DATA_FRAME_STRUCT tx_frame;
+                    tx_frame.id = CLAXON_SENSOR_ID;
+                    tx_frame.datalen = 1;
+                    tx_frame.data[0] = claxon_state; // 0
+                    (void)can_tx_extended_data_frame(&tx_frame);
+                    cyclish_uit_teller++;           
+                }
+
                 next_claxon_tx = make_timeout_time_ms(CLAXON_CYCLIC_MS);
             }
 
@@ -276,21 +330,31 @@ int main() {
             next_heartbeat = make_timeout_time_ms(HEARTBEAT_INTERVAL_MS);
         }
 
+        // Heartbeat timeout -> eerst SPI-check opnieuw; op basis daarvan foutmelding kiezen.
         if (peer_online &&
             absolute_time_diff_us(last_rx_heartbeat, get_absolute_time()) >
                 (HEARTBEAT_TIMEOUT_MS * 1000)) {
 
-            printf("Node niet meer zichtbaar op de bus\n");
+            int ok = mcp2515_check_spi();
+            if (!ok) {
+                spi_error = true;
+                report_once("MCP2515 SPI fout gedetecteerd");
+            } else {
+                report_once("andere node niet meer zichtbaar");
+            }
+
             peer_online = false;
 
             if (NODE_ROLE == 1) {
                 node_offbus = true;
-                error_reported = true;
             }
         }
         #endif
 
         // Periodieke SPI-test en eventueel herinitialiseren MCP2515.
+        // - Zonder heartbeat: exact zoals het was (cyclisch).
+        // - Met heartbeat: alleen cyclisch proberen te herstellen ALS we al in spi_error zitten.
+        #if !ENABLE_HEARTBEAT
         if (absolute_time_diff_us(get_absolute_time(), next_spi_check) <= 0) {
             int ok = mcp2515_check_spi();
             if (!ok) {
@@ -314,8 +378,31 @@ int main() {
                     }
                 }
             }
-            next_spi_check = make_timeout_time_ms(1000);
+            next_spi_check = make_timeout_time_ms(3000);
         }
+        #else
+        if (spi_error && absolute_time_diff_us(get_absolute_time(), next_spi_check) <= 0) {
+            // Alleen herstelpogingen wanneer SPI al fout staat
+            int ok = mcp2515_check_spi();
+            if (ok) {
+                printf("SPI aan het reinitialiseren...\n");
+                can_init(REQOP_NORMAL);
+                can_set_rx_handler(&on_can_rx);
+                can_set_tx_handler(&on_can_tx);
+                can_set_err_handler(&on_can_err);
+                can_set_gpio_irq_handler(&app_gpio_irq_handler);
+
+                ok = mcp2515_check_spi();
+                if (ok) {
+                    spi_error = false;
+                    printf("MCP2515 SPI hersteld.\n");
+                    // foutmelding opnieuw armeren voor volgende echte uitval
+                    error_reported = false;
+                }
+            }
+            next_spi_check = make_timeout_time_ms(3000);
+        }
+        #endif
 
         if (absolute_time_diff_us(get_absolute_time(), next_uart_print) <= 0) {
             if(last_tx_frame.data[0] != last_tx_frame_printed.data[0])
@@ -355,13 +442,14 @@ void on_can_rx(CAN_DATA_FRAME_STRUCT *frame)
             can_set_gpio_irq_handler(&app_gpio_irq_handler);
 
             node_offbus = false;
-            error_reported = false;
             peer_online = true;
+            error_reported = false; // foutmelding opnieuw armeren na herstel
         } else {
             if (!peer_online) {
                 printf("Node zichtbaar op de bus\n");
             }
             peer_online = true;
+            error_reported = false; // foutmelding opnieuw armeren na herstel
         }
         return;
     }
@@ -372,7 +460,12 @@ void on_can_rx(CAN_DATA_FRAME_STRUCT *frame)
             return;
         }
 
-        gpio_put(CLAXON_LED, frame->data[0] ? 1 : 0);
+        // Receiver failsafe: markeer laatste geldige claxonframe
+        last_rx_claxon = get_absolute_time();
+        failsafe_tripped = false;
+
+        claxon_output = frame->data[0] ? true : false;
+        gpio_put(CLAXON_LED, claxon_output ? 1 : 0);
 
         CAN_DATA_FRAME_STRUCT tx_frame;
         tx_frame.id = CLAXON_STATUS_ID;
@@ -406,7 +499,7 @@ void on_can_err(CAN_ERR_FRAME_STRUCT *err)
     // Zet zender in offbus; melding maar één keer
     if (NODE_ROLE == 1) {
         node_offbus = true;
-        report_peer_missing_once();
+        report_once("Node niet meer zichtbaar op de bus");
     }
 }
 
@@ -471,12 +564,15 @@ void debug_errframe(CAN_ERR_FRAME_STRUCT *frame)
 
 int mcp2515_check_spi(void)
 {
+    const uint8_t test = 0x05;
+
     uint8_t orig = mcp2515_read_register(MCP2515_TEST_REG);
 
-    mcp2515_write_register(MCP2515_TEST_REG, 0x55);
-    uint8_t a = mcp2515_read_register(MCP2515_TEST_REG);
+    mcp2515_write_register(MCP2515_TEST_REG, test);
+    uint8_t rd = mcp2515_read_register(MCP2515_TEST_REG);
 
     mcp2515_write_register(MCP2515_TEST_REG, orig);
 
-    return (a != orig);
+    // 1 = OK (readback komt overeen met 0x05), 0 = fout
+    return (rd == test);
 }
