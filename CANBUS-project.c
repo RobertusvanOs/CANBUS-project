@@ -6,15 +6,11 @@ Basic MCP2515 CAN application. Rx and Tx of CAN frames
 
 v1.0    2023-10-10: Initial code
 v1.1    2023-12-04: Added filtering example
-v2.0    2026-1-21: Testopstelling door R. van Os en G. Lassche
+v2.0    2026-1-20: Testopstelling door R. van Os en G. Lassche
 
 ***************************************************/
 
-//Aan: cycling zenden, Uit: Een aantal keer bevestigen, DONE
-//ACK: uit de code halen. 
-//Ontvanger: 250ms geen signaal = claxon uit. 
-//Heartbeat optioneel toevoegen. DONE
-
+//Importeren van bibliotheken
 #include "stdio.h"
 #include "stdlib.h"
 #include "string.h"
@@ -40,23 +36,24 @@ void debug_errframe(CAN_ERR_FRAME_STRUCT *frame);
 //
 //Node_Role 1 is de zender, Node_Role 2 de ontvanger.
 #define NODE_ROLE 1
-#define ENABLE_HEARTBEAT   1   // set to 0 to disable
+#define ENABLE_HEARTBEAT   1   // 1 = heartmodus 0 = zonder heartbeat modus
 //
 //Claxon sensor en claxon ID.
-#define CLAXON_SENSOR_ID 0x599
-#define CLAXON_STATUS_ID 0x733
+#define CLAXON_SENSOR_ID 0x599 //ID van de verzendende kant
+#define CLAXON_STATUS_ID 0x733 //ID van de ontvangende kant
 
-// Led die aangeeft of de claxon aan is.
+// Claxon actuator pin 
 #define CLAXON_LED 15
 
-// Knop pin (in main.c)
+// Knop pin (claxon sensor pin)
 #define CLAXON_KNOP 2
 
 // Debounce tijd (microseconden)
 #define KNOP_DEBOUNCE_US 20000u   // 20 ms
 
-// Claxon cyclisch herhalen (ms) zodat een “domme” ontvanger blijft volgen
+// Claxon cyclisch herhalen (ms) zodat een ontvanger blijft volgen
 #define CLAXON_CYCLIC_MS 50
+//initialiseren van herhaal-timer voor uit zenden van 5 uit signalen
 uint8_t cyclish_uit_teller = 0;
 
 //SPI check. 
@@ -102,6 +99,7 @@ typedef struct {
 static queue_t button_queue;
 static volatile uint32_t button_queue_overflow = 0;
 
+//Functie voor het uitlezen van de claxon knop
 static inline bool knop_status_from_pin(void)
 {
     return (gpio_get(CLAXON_KNOP) == 0) ? 1 : 0;
@@ -131,12 +129,14 @@ static inline void report_once(const char *msg)
     }
 }
 
-int main() {
 
+int main() {
+    //USB functionaliteit initialiseren
     stdio_usb_init();
+    //Startup timeout
     sleep_ms(STARTUP_DELAY_MS);
 
-    // Led init.
+    //Claxon pin initialiseren en instellen op output
     gpio_init(CLAXON_LED);
     gpio_set_dir(CLAXON_LED, GPIO_OUT);
 
@@ -148,17 +148,20 @@ int main() {
         sleep_ms(500);
     }
 
-    // Queue init (voor IRQ aan)
+    // Queue init (voor IRQ aan), Hier worden 
     queue_init(&button_queue, sizeof(button_event_t), 3);
         
-    // Knop init (in main.c)
+    // Knop initialiseren (claxon sensor)
     gpio_init(CLAXON_KNOP);
+    // Knop richting instellen op input
     gpio_set_dir(CLAXON_KNOP, GPIO_IN);
+    //Interne pullup instellen
     gpio_pull_up(CLAXON_KNOP);
 
+    //MCP2515 initaliseren
     can_init(REQOP_NORMAL);
 
-    // Register onze app gpio handler (knop zit nu in main.c)
+    // Register onze app gpio handler
     can_set_gpio_irq_handler(&app_gpio_irq_handler);
 
     // Knop IRQ aanzetten (callback is al geregistreerd door can_init)
@@ -171,15 +174,21 @@ int main() {
     // Herstel-timer voor CAN (zonder heartbeat)
     absolute_time_t next_can_recover = make_timeout_time_ms(CAN_RECOVER_INTERVAL_MS);
 
+    //Uart timeout initialiseren zodat er maar maximaal 1x per UART_TIMEOUT een bericht op de seriele bus kan worden gestuurd. 
     #define UART_TIMEOUT 100
     absolute_time_t next_uart_print = make_timeout_time_ms(UART_TIMEOUT);
+
+    //Variabele voor het opslaan van het laatst ontvangen frame
     CAN_DATA_FRAME_STRUCT last_tx_frame = {0};
     int last_rc = 0;
+    //Variabele voor het opslaag van het laatst geprinte frame
     CAN_DATA_FRAME_STRUCT last_tx_frame_printed = {0};
 
     // Receiver failsafe init (role 2)
     last_rx_claxon = get_absolute_time();
+    //Claxon waarde = 0 bij opstarten
     claxon_output = false;
+    // Variabele voor het opslaan van een failsafe-trip, dit houdt in dat er geen CAN berichten zijn ontvangen waar de claxon AAN wordt gestuurd in de afgelopen 250ms, dit voorkomt dat de claxon onnodig aan blijft
     failsafe_tripped = false;
     gpio_put(CLAXON_LED, 0);
 
@@ -192,7 +201,7 @@ int main() {
 
     debug_config();
 
-    #if ENABLE_HEARTBEAT
+    #if ENABLE_HEARTBEAT //Deze code wordt uigevoerd als de heartbeat modus aan staat.
     // Heartbeat timers initialiseren.
     // (SPI-check is hierboven al als eerste gedaan)
     next_heartbeat = make_timeout_time_ms(HEARTBEAT_INTERVAL_MS);
@@ -202,6 +211,7 @@ int main() {
     error_reported = false;
     #endif
 
+    //Handlers voor het verwerken van ontvangen en te verzenden berichten 
     can_set_rx_handler(&on_can_rx);
     can_set_tx_handler(&on_can_tx);
     can_set_err_handler(&on_can_err);
@@ -213,8 +223,9 @@ int main() {
     //tijd variabele voor debouncing button
     static uint32_t last_accepted_us = 0;
 
+    //Main loop
     while (true) {
-        can_poll();
+        can_poll(); //Nieuwe CAN berichten ophalen
 
         // FAILSAFE role 2: geen claxonframes binnen FAILSAFE_TIMEOUT_MS => claxon uit
         if (NODE_ROLE == 2 && claxon_output) {
@@ -236,7 +247,7 @@ int main() {
         }
 
         // Herstel zonder heartbeat: zender terug laten komen, maar NIET opnieuw foutmelding armeren.
-        #if !ENABLE_HEARTBEAT
+        #if !ENABLE_HEARTBEAT //Deze code wordt uigevoert als de mictrocontroller NIET in heartbeat modus staat
         if (NODE_ROLE == 1 && node_offbus && !spi_error) {
             if (absolute_time_diff_us(get_absolute_time(), next_can_recover) <= 0) {
                 can_init(REQOP_NORMAL);
@@ -264,12 +275,12 @@ int main() {
 
             //Knop uitlezen via IRQ-trigger en debounce toepassen
             button_event_t ev;
-            if (queue_try_remove(&button_queue, &ev)) {
+            if (queue_try_remove(&button_queue, &ev)) { //Hier wordt de laatste event van een claxon-input uitgelezen en verwerkt
                 if ((uint32_t)(ev.t_us - last_accepted_us) > KNOP_DEBOUNCE_US) {
                     last_accepted_us = ev.t_us;
                     claxon_state = ev.state;
 
-                    // BRACE-FIX: alleen zenden als debounce is geaccepteerd
+                    //CAN Frame opbouwen met claxon AAN = 0x01 of UIT = 0x00 en ID = CLAXON_SENSOR_ID
                     CAN_DATA_FRAME_STRUCT tx_frame;
                     tx_frame.id = CLAXON_SENSOR_ID;
                     tx_frame.datalen = 1;
@@ -295,7 +306,7 @@ int main() {
                     tx_frame.data[0] = claxon_state;
                     (void)can_tx_extended_data_frame(&tx_frame);
                 }
-                else if (cyclish_uit_teller < 5) {
+                else if (cyclish_uit_teller < 5) {//Niet meer dan 5 UIT berichten sturen in verband met onnodige belasting op de bus
                     CAN_DATA_FRAME_STRUCT tx_frame;
                     tx_frame.id = CLAXON_SENSOR_ID;
                     tx_frame.datalen = 1;
@@ -304,7 +315,7 @@ int main() {
                     cyclish_uit_teller++;           
                 }
 
-                next_claxon_tx = make_timeout_time_ms(CLAXON_CYCLIC_MS);
+                next_claxon_tx = make_timeout_time_ms(CLAXON_CYCLIC_MS); //
             }
 
         } else {
@@ -318,7 +329,7 @@ int main() {
 
         #if ENABLE_HEARTBEAT
         bool hb_blocked = (NODE_ROLE == 1 && node_offbus);
-        if (!hb_blocked &&
+        if (!hb_blocked && //Versturen van de volgende heartbeat
             absolute_time_diff_us(get_absolute_time(), next_heartbeat) <= 0) {
 
             CAN_DATA_FRAME_STRUCT hb;
@@ -352,7 +363,7 @@ int main() {
         #endif
 
         // Periodieke SPI-test en eventueel herinitialiseren MCP2515.
-        // - Zonder heartbeat: exact zoals het was (cyclisch).
+        // - Zonder heartbeat: cyclisch.
         // - Met heartbeat: alleen cyclisch proberen te herstellen ALS we al in spi_error zitten.
         #if !ENABLE_HEARTBEAT
         if (absolute_time_diff_us(get_absolute_time(), next_spi_check) <= 0) {
